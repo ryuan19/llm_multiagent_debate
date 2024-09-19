@@ -1,70 +1,215 @@
-import openai
+import requests
 import json
 import numpy as np
 import random
-
-def construct_message(agents, question, idx):
-    if len(agents) == 0:
-        return {"role": "user", "content": "Can you double check that your answer is correct. Please reiterate your answer, with your final answer a single numerical number, in the form \\boxed{{answer}}."}
-
-    prefix_string = "These are the solutions to the problem from other agents: "
-
-    for agent in agents:
-        agent_response = agent[idx]["content"]
-        response = "\n\n One agent solution: ```{}```".format(agent_response)
-
-        prefix_string = prefix_string + response
-
-    prefix_string = prefix_string + """\n\n Using the solutions from other agents as additional information, can you provide your answer to the math problem? \n The original math problem is {}. Your final answer should be a single numerical number, in the form \\boxed{{answer}}, at the end of your response.""".format(question)
-    return {"role": "user", "content": prefix_string}
+import time
+from tqdm import tqdm
+import argparse
+import random
 
 
-def construct_assistant_message(completion):
-    content = completion["choices"][0]["message"]["content"]
-    return {"role": "assistant", "content": content}
+def args_parse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rounds", default=2, type=int)
+    parser.add_argument("--agents", default=2, type=int)
+    parser.add_argument("--num_questions", default=1, type=int)
+    parser.add_argument('--isModerator', action='store_true')
+    parser.add_argument('--roleplay', action='store_true')
+    parser.add_argument('--confidence', action='store_true')
+    return parser.parse_args()
 
+# pipe for my model
+
+
+def generate_gsm(numagents, question):
+    agent_contexts = [
+        [{"model": f"model{i}", "content": f"Solve the following math problem: {question} Explain your reasoning and state your answer. Your final answer should be a single numerical number, in the form \\boxed{{answer}}, at the end of your response."}] for i in range(numagents)
+        ]
+    return agent_contexts
+
+def generate_gsm_roleplay(numagents, question):
+    agent_contexts = [
+        [{"model": f"model{i}", "content": f"You are someone who failed grade school. Try to solve the following math problem: {question} Explain your reasoning and state your answer. Your final answer should be a single numerical number, in the form \\boxed{{answer}}, at the end of your response."}] for i in range(numagents)
+        ]
+    return agent_contexts
+
+def generate_gsm_roleplay_confidence(numagents, question):
+    agent_contexts = [
+        [{"model": f"model{i}", "content": f"You are someone who failed grade school. Try to solve the following math problem: {question} Explain your reasoning and state your answer, along with a score from 1-5 (1 being unconfident) representing how confident you are in your answer. Your final answer should be a single numerical number, in the form \\boxed{{answer}}, at the end of your response."}] for i in range(numagents)
+        ]
+    return agent_contexts
 
 def read_jsonl(path: str):
-    with open(path) as fh:
+    with open(path, "r") as fh:
         return [json.loads(line) for line in fh.readlines() if line]
 
+def ask_agent(prompt, pipe):
+    formatted_prompt = [{"role": "user", "content": prompt}]
+    # generation_args = {
+    #     "max_new_tokens": 500,
+    #     "return_full_text": False,
+    #     "temperature": 0.7, #creativity basically
+    #     "do_sample": True, #greedy otherwise, give same res
+    # }
+
+    #make responses a bit more interesting
+    generation_args_list = [{
+        "max_new_tokens": 500,
+        "return_full_text": False,
+        "do_sample": True,
+        "temperature": 0.6,            # Increase temperature for more randomness
+        "top_p": 0.9,                 # Nucleus sampling with 95% probability mass
+        "num_return_sequences": 1,     # Number of responses to generate
+        "eos_token_id": pipe.tokenizer.eos_token_id,  # Ensure proper termination
+    },
+    {
+        "max_new_tokens": 500,
+        "return_full_text": False,
+        "do_sample": True,
+        "temperature": 0.7,            # Increase temperature for more randomness
+        "top_p": 0.9,                 # Nucleus sampling with 95% probability mass
+        "num_return_sequences": 1,     # Number of responses to generate
+        "eos_token_id": pipe.tokenizer.eos_token_id,  # Ensure proper termination
+    },
+    {
+        "max_new_tokens": 500,
+        "return_full_text": False,
+        "do_sample": True,
+        "temperature": 0.8,            # Increase temperature for more randomness
+        "top_p": 0.95,                 # Nucleus sampling with 95% probability mass
+        "num_return_sequences": 1,     # Number of responses to generate
+        "eos_token_id": pipe.tokenizer.eos_token_id,  # Ensure proper termination
+    }
+    ]
+    generation_args = random.choice(generation_args_list)
+     #for my reference: https://towardsdatascience.com/decoding-strategies-that-you-need-to-know-for-response-generation-ba95ee0faadc
+
+    output = pipe(formatted_prompt, **generation_args)
+    res = output[0]['generated_text']
+    return res #text output
+
+def ask_agent_last(prompt, pipe):
+    formatted_prompt = [{"role": "user", "content": prompt}]
+    generation_args = {
+        "max_new_tokens": 500,
+        "return_full_text": False,
+        "temperature": 0.7, #creativity basically
+        "do_sample": True, #greedy otherwise, give same res
+    }
+    output = pipe(formatted_prompt, **generation_args)
+    res = output[0]['generated_text']
+    return res
+
+def get_pipe():
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+    model = AutoModelForCausalLM.from_pretrained(
+        "microsoft/Phi-3.5-mini-instruct",
+        device_map="cuda",
+        torch_dtype="auto",
+        trust_remote_code=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3.5-mini-instruct")
+    pipe = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+    )
+    return pipe
+
+
 if __name__ == "__main__":
-    agents = 3
-    rounds = 2
+    args = args_parse()
+
+    num_agents = args.agents
+    num_rounds = args.rounds
     random.seed(0)
 
-    generated_description = {}
+    evaluation = args.num_questions
 
-    questions = read_jsonl("/data/vision/billf/scratch/yilundu/llm_iterative_debate/grade-school-math/grade_school_math/data/test.jsonl")
-    random.shuffle(questions)
+    #define pipe
+    pipe = get_pipe()
 
-    for data in questions[:100]:
-        question = data['question']
-        answer = data['answer']
+    generated_description = []
 
-        agent_contexts = [[{"role": "user", "content": """Can you solve the following math problem? {} Explain your reasoning. Your final answer should be a single numerical number, in the form \\boxed{{answer}}, at the end of your response. """.format(question)}] for agent in range(agents)]
+    questions = read_jsonl("/content/gsm8k_test.jsonl")
+    #random.shuffle(questions)
 
-        for round in range(rounds):
+    for idx in tqdm(range(evaluation)):
+        question = questions[idx]["question"]
+        answer = questions[idx]["answer"]
+
+
+        if args.roleplay and args.confidence:
+          print("Taking role with confidence...")
+          agent_contexts = generate_gsm_roleplay_confidence(num_agents, question)
+        elif args.roleplay:
+          print("Taking role...")
+          agent_contexts = generate_gsm_roleplay(num_agents, question)
+        else:
+          agent_contexts = generate_gsm(num_agents, question) #generates the initial questions
+
+        print(f"# Question No.{idx+1} starts...")
+
+        message = []
+
+        # Debate
+        for round in range(num_rounds+1):
+            # Refer to the summarized previous response
+            if round != 0: #entering debate rounds
+                feedback = "Based on the solutions from the other agents, update your own answer if you think you made a mistake in your calculations. If not, further reason why your original answer is correct."
+                prev_responses = [agent[-1]["content"] for agent in agent_contexts]
+                for i, agent_context in enumerate(agent_contexts):
+                    other_responses = prev_responses[:i] + prev_responses[i+1:] #all other responses except own
+                    if args.confidence:
+                        prompt = f"Solve the following math problem: {question} Explain your reasoning and state your answer, along with a score from 1-5 (1 being unconfident) representing how confident you are in your answer. Your final answer should be a single numerical number, in the form \\boxed{{answer}}, at the end of your response."
+                    else:
+                        prompt = f"Solve the following math problem: {question} Explain your reasoning and state your answer. Your final answer should be a single numerical number, in the form \\boxed{{answer}}, at the end of your response." #OG question
+                    #add other agents response
+                    if other_responses:
+                        prompt += "\n\n Here are opinions from other agents and how confident they are in their answers:\n\n"
+                        for i, other in enumerate(other_responses):
+                            prompt += f"Agent{i}: {other}\n\n"
+
+                    agent_context.append(
+                        {"model": agent_context[-1]["model"], "content": prompt}
+                    )
+
+
             for i, agent_context in enumerate(agent_contexts):
+                agent_prompt = agent_context[-1]["content"] #the content
+                text = ask_agent(agent_prompt, pipe) #get llm answer
 
-                if round != 0:
-                    agent_contexts_other = agent_contexts[:i] + agent_contexts[i+1:]
-                    message = construct_message(agent_contexts_other, question, 2*round - 1)
-                    agent_context.append(message)
+                agent_context.append( #formatted so keep track of which model and which response
+                    {"model": agent_context[-1]["model"], "content": text}
+                )
 
-                completion = openai.ChatCompletion.create(
-                          model="gpt-3.5-turbo-0301",
-                          messages=agent_context,
-                          n=1)
+        print(f"# Question No.{idx+1} debate is ended.")
 
-                assistant_message = construct_assistant_message(completion)
-                agent_context.append(assistant_message)
 
-        generated_description[question] = (agent_contexts, answer)
+        models_response = {
+            f"model_{i}": [context[j]["content"] for j in range(1, len(context), 2)]
+            for i, context in enumerate(agent_contexts)
+        }
+        allanswers = f"Here is the math problem: {question} "
+        allanswers += "Here is a list of possible solutions given by other agents:\n "
+        for i, model in enumerate(models_response):
+            allanswers += f"Model {i+1}: {models_response[model][-1]}\n"
+        allanswers += "Read the list of solutions above, and from them, determine which is correct. If none of them are, give your own final answer using the other response's logic as guidance. Your final answer should be a single numerical number, in the form \\boxed{{answer}}, at the end of your response. \n"
 
-    json.dump(generated_description, open("gsm_{}_{}.json".format(agents, rounds), "w"))
+        if args.isModerator:
+            final_answer = ask_agent_last(allanswers, pipe)
+            generated_description.append({"question_id": idx, "question": question, "all_agent_answers": models_response,"agent_response": allanswers, "final_answer": final_answer,"answer": answer})
+        elif args.roleplay:
+            if args.confidence: #has confidence
+                p = f"You are someone who failed grade school. Try to solve the following math problem: {question} Explain your reasoning and state your answer, along with a score from 1-5 (1 being unconfident) representing how confident you are in your answer. Your final answer should be a single numerical number, in the form \\boxed{{answer}}, at the end of your response."
+            else:
+                p = f"You are someone who failed grade school. Try to solve the following math problem: {question} Explain your reasoning and state your answer. Your final answer should be a single numerical number, in the form \\boxed{{answer}}, at the end of your response."
+            generated_description.append({"question_id": idx, "prompt": p, "question": question, "all_agent_answers": models_response,"agent_response": allanswers, "answer": answer})
+        else:
+            generated_description.append({"question_id": idx, "question": question, "all_agent_answers": models_response,"agent_response": allanswers, "answer": answer})
 
-    import pdb
-    pdb.set_trace()
-    print(answer)
-    print(agent_context)
+
+    with open("/content/gsm_res/gsm_{}_{}.json".format(num_agents, num_rounds), "w") as json_file:
+        json.dump(generated_description, json_file, indent=4)
+    print("All done!!!")

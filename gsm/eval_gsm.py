@@ -1,8 +1,18 @@
 import json
-import openai
 import numpy as np
 import time
 import re
+import argparse
+
+def args_parse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--filename", type=str)
+    parser.add_argument("--num_agents", default=1, type=int)
+    parser.add_argument("--savepath", default=None, type=str)
+    parser.add_argument("--loadpath", default=None, type=str)
+    parser.add_argument('--isModerator', action='store_true')
+    parser.add_argument('--role', action='store_true')
+    return parser.parse_args()
 
 def parse_bullets(sentence):
     bullets_preprocess = sentence.split("\n")
@@ -84,6 +94,7 @@ def compute_accuracy(gt, pred_solution):
             pred_answers.append(pred_answer)
 
         # print("pred_answers: ", pred_answers)
+
         pred_answer = most_frequent(pred_answers)
         # print("pred answer: ", pred_answer)
         # pred_answer = pred_answers[0]
@@ -93,13 +104,15 @@ def compute_accuracy(gt, pred_solution):
             pred_answer = solve_math_problems(pred_solution)
 
     if pred_answer is None:
-        return 1
+        return float(pred_answer), False
 
-    # try:
-    if float(answers) == float(pred_answer):
-        return 1
-    else:
-        return 0
+    return float(pred_answer), float(answers) == float(pred_answer)
+    # print(float(pred_answer), float(answers))
+    # # try:
+    # if float(answers) == float(pred_answer):
+    #     return 1
+    # else:
+    #     return 0
     # except:
     #     import pdb
     #     pdb.set_trace()
@@ -119,29 +132,89 @@ def most_frequent(List):
     return num
 
 if __name__ == "__main__":
-    response_dict = json.load(open("gsm_debate_3_3.json", "r"))
+    args = args_parse()
+    save_path = args.savepath
+    load_path = args.loadpath
+    isModerator = args.isModerator
 
-    questions = list(response_dict.keys())
+    all_my_answers = []
+
+    with open(f"{load_path}{args.filename}", "r") as f:
+        response_dict = json.load(f)
+
+    questions = [response_dict[i]["question"] for i in range(len(response_dict))] #list(response_dict.keys()) #all questions
 
     accuracies = []
 
-    for question in questions:
-        responses, gt = response_dict[question]
 
-        pred_solutions = []
-        for response in responses:
-            pred_solution = response[-1]['content']
+    for i, question in enumerate(questions):
 
-            pred_solutions.append(pred_solution)
+        responses = []
+        # for response in response_dict:
+        #       question_string = response["agent_response"][f"model_{round}"][-1]
+        #       responses.append(question_string)
+        response = response_dict[i]
 
-        accurate = compute_accuracy(gt, pred_solutions)
+        for agentnumber in range(args.num_agents):
+            if args.role:
+                for j in range(len(response["all_agent_answers"][f"model_{agentnumber}"])): #saved as wrong thing
+                    question_string = response["all_agent_answers"][f"model_{agentnumber}"][j]
+                    responses.append(question_string)
 
-        if accurate is not None:
-            accuracies.append(float(accurate))
+
+                pred_solutions = []
+                for res in responses:
+                    # print(response)
+                    # pred_solution = response[-1]['content']
+                    pred_solutions.append(res)
+            elif not isModerator:
+                for k in range(len(response["agent_response"][f"model_{agentnumber}"])):
+                    question_string = response["agent_response"][f"model_{agentnumber}"][k]
+                    responses.append(question_string)
+                #print(f"here{agentnumber} {args.num_agents}", len(response["agent_response"][f"model_{agentnumber}"]))
+
+                pred_solutions = []
+                for res in responses:
+                    # print(response)
+                    # pred_solution = response[-1]['content']
+                    pred_solutions.append(res)
+
+        gt = response_dict[i]["answer"] #real answer
+        #responses, gt = response_dict[question]
+        if not isModerator:
+
+            agent_answer, correctness = compute_accuracy(gt, pred_solutions)
+
         else:
-            import pdb
-            pdb.set_trace()
-            print(gt)
+            agent_answer, correctness = compute_accuracy(gt, response["final_answer"]) #for moderator experiement only
 
-        print("accuracies:", np.mean(accuracies), np.std(accuracies) / (len(accuracies) ** 0.5))
+        print(f"Q{i} : " , agent_answer, correctness)
+        if correctness:
+            accuracies.append(1)
+        else:
+            accuracies.append(0)
 
+        if not isModerator:
+            res = {
+            "question": question,
+            "real_answer": gt,
+            "agent_answer": agent_answer,
+            "correct": correctness #true or false
+        }
+        else:
+            res = {
+            "question": question,
+            "real_answer": gt,
+            "agent_answer": agent_answer,
+            "agent_responses_final": response["final_answer"], #has final response
+            "correct": correctness #true or false
+        }
+
+        all_my_answers.append(res)
+
+
+    print("accuracies:", np.mean(accuracies), np.std(accuracies) / (len(accuracies) ** 0.5))
+    all_my_answers.append({"Total performance: " : np.mean(accuracies)})
+    with open(f"{save_path}{args.filename}", "w") as f:
+        json.dump(all_my_answers, f, indent=4)
+    print("All done!!! + saved")
